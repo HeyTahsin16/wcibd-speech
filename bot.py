@@ -2,13 +2,19 @@
 WCIBD Discord Bot
 ─────────────────────────────────────────────────────────────────
 Usage:
-  wcibd                  → sends a random image from your GitHub stash
+  wcibd                  → sends the next image from a shuffled, no-repeat
+                           deck pulled from your GitHub stash
   wcibd <keyword>        → if the keyword exists in responses.json, the bot
                            replies with the mapped sentence; otherwise sends
-                           a random image.
+                           the next image instead.
 
   When used as a reply, the bot always responds to the *original* message
   author (not the person who typed wcibd).
+
+  Image order: images are dealt from a shuffled deck — every image is shown
+  once before any repeats, and no image is ever immediately followed by
+  itself (including across a reshuffle). This lives in memory, so a restart
+  simply starts a fresh shuffle.
 ─────────────────────────────────────────────────────────────────
 """
 
@@ -59,6 +65,46 @@ _cache: dict = {
     'responses': {'data': None, 'ts': 0.0},
     'images':    {'data': None, 'ts': 0.0},
 }
+
+# ── No-repeat image sequencer ───────────────────────────────────────────────────
+# Keeps a shuffled "deck" of images. Each send pops the next card off the deck.
+# Once the deck is empty it's reshuffled — and the reshuffle is checked so the
+# new first card never matches the last card that was just sent (no back-to-back
+# repeats, even across a reshuffle). Lives purely in memory: resets on restart,
+# which is fine since "the first one can be anything".
+_shuffle_state: dict = {
+    'queue': [],                # list[dict] — remaining images for this cycle
+    'last_sent': None,          # str|None — filename of the last image sent
+    'snapshot': frozenset(),    # set of filenames the current queue was built from
+}
+
+
+def _build_deck(images: list) -> list:
+    """Return a freshly shuffled copy of `images`, avoiding a repeat of last_sent
+    in the first slot (when possible)."""
+    deck = images.copy()
+    random.shuffle(deck)
+    last = _shuffle_state['last_sent']
+    if last is not None and len(deck) > 1 and deck[0]['name'] == last:
+        deck[0], deck[1] = deck[1], deck[0]
+    return deck
+
+
+def get_next_image(images: list) -> dict:
+    """
+    Pop the next image off the no-repeat deck. Rebuilds/reshuffles the deck
+    when it's empty or when the available image set has changed (new images
+    pushed to GitHub, old ones removed/renamed).
+    """
+    current_names = frozenset(img['name'] for img in images)
+
+    if not _shuffle_state['queue'] or _shuffle_state['snapshot'] != current_names:
+        _shuffle_state['queue'] = _build_deck(images)
+        _shuffle_state['snapshot'] = current_names
+
+    pick = _shuffle_state['queue'].pop(0)
+    _shuffle_state['last_sent'] = pick['name']
+    return pick
 
 # ── GitHub helpers ─────────────────────────────────────────────────────────────
 
@@ -203,8 +249,8 @@ async def on_message(message: discord.Message):
             )
             return
 
-        pick = random.choice(images)
-        log.info('Sending image: %s', pick['name'])
+        pick = get_next_image(images)
+        log.info('Sending image: %s  (%d left in deck)', pick['name'], len(_shuffle_state['queue']))
 
         try:
             async with session.get(pick['download_url']) as r:
